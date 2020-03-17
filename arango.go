@@ -18,10 +18,7 @@ import (
 	"time"
 )
 
-
-
 // changes begin
-
 
 var (
 	MetadataLen       int = 10
@@ -31,7 +28,6 @@ var (
 )
 
 var _ dbplugin.Database = (*Arango)(nil)
-
 
 //entry
 // Run instantiates a MySQL object, and runs the RPC server for the plugin
@@ -84,18 +80,18 @@ func new(displayNameLen, roleNameLen, usernameLen int) *Arango {
 
 // SQLConnectionProducer implements ConnectionProducer and provides a generic producer for most sql databases
 type Arango struct {
-	Url				string
-	Username                 string
-	Password                 string
-	Host string
-	Port string
-	Initialized           bool
+	Url         string
+	Username    string
+	Password    string
+	Host        string
+	Port        string
+	Initialized bool
 	*connutil.SQLConnectionProducer
 	credsutil.CredentialsProducer
 }
 
 func (a *Arango) Type() (string, error) {
-	return "arango", nil
+	return "mysql", nil
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
@@ -107,7 +103,7 @@ func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements,
 }
 
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
-	return nil,nil
+	return nil, nil
 }
 
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
@@ -209,10 +205,7 @@ func (a *Arango) verify() ([]string, error) {
 	return usernames, nil
 }
 
-
 // change end
-
-
 
 const (
 	host         string = "192.168.1.24"
