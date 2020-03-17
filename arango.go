@@ -95,6 +95,7 @@ func (a *Arango) Type() (string, error) {
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
+	
 	return nil
 }
 
