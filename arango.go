@@ -13,7 +13,10 @@ import (
 	"github.com/hashicorp/vault/sdk/database/dbplugin"
 	"github.com/hashicorp/vault/sdk/database/helper/connutil"
 	"github.com/hashicorp/vault/sdk/database/helper/credsutil"
+	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
 	"io/ioutil"
+	"log"
+	"log/syslog"
 	"net/http"
 	"time"
 )
@@ -90,33 +93,43 @@ type Arango struct {
 	credsutil.CredentialsProducer
 }
 
+type Database struct {
+	Name string `json:"name"`
+	Users []struct{
+		Active bool   `json:"active"`
+		Username string `json:"username"`
+		Passwd string `json:"passwd"`
+	} `json:"users"`
+}
+
 func (a *Arango) Type() (string, error) {
 	return "arango", nil
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
-	fmt.Println("by gary called: RenewUser ")
+	go aLog("by gary called: RenewUser ")
 	return nil
 }
 
 func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
-	fmt.Println("by gary called: RevokeUser ")
+	go aLog("by gary called: RevokeUser ")
+	a.deleteUserInternal(username)
 	return nil
 }
 
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
-	fmt.Println("by gary called: RotateRootCredentials ")
+	go aLog("by gary called: RotateRootCredentials ")
 	return nil, nil
 }
 
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
-	fmt.Println("by gary called: SetCredentials ")
+	go aLog("by gary called: SetCredentials ")
 	return "gary", "test", nil
 }
 
 func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyConnection bool) (map[string]interface{}, error) {
 
-	fmt.Println("by gary called: Init ")
+	go aLog("by gary called: Init ")
 
 	urlValue, ok := conf["connection_url"]
 	userValue, ok := conf["username"]
@@ -150,8 +163,17 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 
 func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements, usernameConfig dbplugin.UsernameConfig, expiration time.Time) (username string, password string, err error) {
 
-	fmt.Println("by gary called: CreateUser. ")
+	go aLog("by gary called: CreateUser ")
 
+	statements = dbutil.StatementCompatibilityHelper(statements)
+
+	if len(statements.Creation) == 0 {
+		return "", "", dbutil.ErrEmptyCreationStatement
+	}
+
+	databaseName := statements.Creation[0]
+
+	go aLog("passed in database name: " + databaseName)
 	username, err = a.GenerateUsername(usernameConfig)
 	if err != nil {
 		return "", "", err
@@ -162,7 +184,7 @@ func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements,
 		return "", "", err
 	}
 
-	createUser(username, password)
+	a.creatDatabase(username, password, databaseName)
 	//deleteUser(username)
 
 	return username, password, nil
@@ -215,6 +237,154 @@ func (a *Arango) verify() ([]string, error) {
 	return usernames, nil
 }
 
+func (a *Arango) creatDatabase(username, password, dbname string) error {
+
+	// Marshal grant
+	database := &Database{
+		Name: dbname,
+		Users: []struct {
+			Active bool   `json:"active"`
+			Username string `json:"username"`
+			Passwd string `json:"passwd"`
+		}{
+			{Active: true, Username: username, Passwd: password},
+		},
+	}
+	fmt.Println(database)
+
+	databaseJson, err := json.Marshal(database)
+	if err != nil {
+		fmt.Println("Error in Marshal: ", err.Error())
+		return err
+	}
+
+	// Formulate req with required headers
+	// POST http://localhost:8529/_db/_system/_api/database
+	//
+	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemDb)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(databaseJson))
+	if err != nil {
+		fmt.Println("Error in NewRequest: ", err.Error())
+		return err
+	}
+	req.SetBasicAuth(a.Username, a.Password)
+	req.Header.Add("Accept", "application/json")
+
+	// Send req
+	arangoClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := arangoClient.Do(req)
+	if err != nil {
+		fmt.Println("Error in req.Do: ", err.Error())
+		return err
+	}
+
+	// Process response
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated {
+		fmt.Printf("database %s has been created for user %s\n", dbname, username)
+		go aLog("database " + dbname + " has been created for user " + username)
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+// createUser creates 'username' with password 'password'
+// in arangodb. Creating a user
+func (a *Arango) createNewUser(username string, password string) error {
+	// Marshal username & password
+	userCred := &UserCredential{
+		User:     username,
+		Password: password,
+	}
+	userjson, err := json.Marshal(userCred)
+	if err != nil {
+		fmt.Println("Error in Marshal: ", err.Error())
+		return err
+	}
+
+	// Formulate req with required headers
+	// POST /_api/user
+	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathUserMgmt)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(userjson))
+	if err != nil {
+		fmt.Println("Error in NewRequest: ", err.Error())
+		return err
+	}
+	req.SetBasicAuth(a.Username, a.Password)
+	req.Header.Add("Accept", "application/json")
+
+	// Send req
+	arangoClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := arangoClient.Do(req)
+	if err != nil {
+		fmt.Println("Error in req.Do: ", err.Error())
+		return err
+	}
+
+	// Process response
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated {
+		fmt.Printf("User %s created successfully\n", username)
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+// deleteUser deletes 'username' from arangodb
+func (a *Arango) deleteUserInternal(username string) error {
+	// Formulate req with required headers
+	// DELETE /_api/user/{user}
+	url := fmt.Sprintf("http://%s:%s/%s/%s", a.Host, a.Port, pathUserMgmt, username)
+	fmt.Println(url)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		fmt.Println("Error in NewRequest: ", err.Error())
+		return err
+	}
+	req.SetBasicAuth(a.Username, a.Password)
+	req.Header.Add("Accept", "application/json")
+
+	// Send req
+	arangoClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := arangoClient.Do(req)
+	if err != nil {
+		fmt.Println("Error in req.Do: ", err.Error())
+		return err
+	}
+
+	// Process response
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		fmt.Printf("User %s deleted successfully\n", username)
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+
+func aLog(msg string) {
+	sysLog, err := syslog.Dial("tcp", "localhost:2514",
+		syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
+	if err != nil {
+		//log.Fatal(err)
+		//log.Println("cannot connect to rsyslog")
+		log.Println("local log" + msg)
+		return
+	}
+	fmt.Fprintf(sysLog, msg)
+}
+
+
+
 // change end
 
 const (
@@ -224,6 +394,7 @@ const (
 	// user 'root' is the default arango user with 'rw' access to '_system' db
 	adminUserName string = "root"
 	adminPassword string = "root"
+	pathSystemDb string = "_db/_system/_api/database"
 )
 
 var (
