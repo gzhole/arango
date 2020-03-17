@@ -23,7 +23,7 @@ import (
 var (
 	MetadataLen       int = 10
 	LegacyMetadataLen int = 4
-	UsernameLen       int = 32
+	UsernameLen       int = 16
 	LegacyUsernameLen int = 16
 )
 
@@ -91,7 +91,7 @@ type Arango struct {
 }
 
 func (a *Arango) Type() (string, error) {
-	return "mysql", nil
+	return "arango", nil
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
