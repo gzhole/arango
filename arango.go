@@ -95,23 +95,29 @@ func (a *Arango) Type() (string, error) {
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
-	
+	fmt.Println("by gary called: RenewUser ")
 	return nil
 }
 
 func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
+	fmt.Println("by gary called: RevokeUser ")
 	return nil
 }
 
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
+	fmt.Println("by gary called: RotateRootCredentials ")
 	return nil, nil
 }
 
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
+	fmt.Println("by gary called: SetCredentials ")
 	return "gary", "test", nil
 }
 
 func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyConnection bool) (map[string]interface{}, error) {
+
+	fmt.Println("by gary called: Init ")
+
 	urlValue, ok := conf["connection_url"]
 	userValue, ok := conf["username"]
 	passValue, ok := conf["password"]
@@ -143,6 +149,9 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 }
 
 func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements, usernameConfig dbplugin.UsernameConfig, expiration time.Time) (username string, password string, err error) {
+
+	fmt.Println("by gary called: CreateUser ")
+
 	username, err = a.GenerateUsername(usernameConfig)
 	if err != nil {
 		return "", "", err
