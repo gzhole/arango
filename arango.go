@@ -95,23 +95,23 @@ type Arango struct {
 }
 
 func (a *Arango) Type() (string, error) {
-	panic("implement me")
+	return "arango", nil
 }
 
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
-	panic("implement me")
+	return nil
 }
 
 func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
-	panic("implement me")
+	return nil
 }
 
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
-	panic("implement me")
+	return nil,nil
 }
 
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
-	panic("implement me")
+	return "gary", "test", nil
 }
 
 func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyConnection bool) (map[string]interface{}, error) {
@@ -215,7 +215,7 @@ func (a *Arango) verify() ([]string, error) {
 
 
 const (
-	host         string = "localhost"
+	host         string = "192.168.1.24"
 	port         int    = 8529
 	pathUserMgmt string = "_api/user"
 	// user 'root' is the default arango user with 'rw' access to '_system' db
