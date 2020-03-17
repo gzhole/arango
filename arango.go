@@ -154,7 +154,7 @@ func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements,
 	}
 
 	createUser(username, password)
-	deleteUser(username)
+	//deleteUser(username)
 
 	return username, password, nil
 }
