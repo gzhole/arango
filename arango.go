@@ -2,7 +2,7 @@ package arango
 
 // Refer https://www.arangodb.com/docs/2.8/http-user-management.html
 // for additional details on the HTTP APIs exposed by Arangodb for
-// user management
+// user management test
 import (
 	"bytes"
 	"context"
