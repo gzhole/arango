@@ -150,7 +150,7 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 
 func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements, usernameConfig dbplugin.UsernameConfig, expiration time.Time) (username string, password string, err error) {
 
-	fmt.Println("by gary called: CreateUser ")
+	fmt.Println("by gary called: CreateUser. ")
 
 	username, err = a.GenerateUsername(usernameConfig)
 	if err != nil {
