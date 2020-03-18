@@ -1,8 +1,8 @@
 package arango
 
-// Refer https://www.arangodb.com/docs/2.8/http-user-management.html
-// for additional details on the HTTP APIs exposed by Arangodb for
-// user management test12
+// Custom Arango DB plugin for HashiCorp Vault. It implemented required Database interface.
+// Refer https://www.vaultproject.io/docs/secrets/databases/custom/.
+// For Arango HTTP API, refer https://www.arangodb.com/docs/stable/http/.
 import (
 	"bytes"
 	"context"
@@ -14,31 +14,97 @@ import (
 	"github.com/hashicorp/vault/sdk/database/helper/connutil"
 	"github.com/hashicorp/vault/sdk/database/helper/credsutil"
 	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
-	"io/ioutil"
 	"log"
 	"log/syslog"
 	"net/http"
+	"sync"
 	"time"
 )
 
-// changes begin
-
-var (
-	MetadataLen       int = 10
-	LegacyMetadataLen int = 4
-	UsernameLen       int = 16
-	LegacyUsernameLen int = 16
+const (
+	MetadataLen  int    = 10
+	UsernameLen  int    = 16
+	pathUserMgmt string = "_api/user"
+	pathSystemDB string = "_db/_system/_api/database"
+	// connection availability check
+	pathSystemTime string = "_db/_system/_admin/time"
 )
 
 var _ dbplugin.Database = (*Arango)(nil)
 
-//entry
-// Run instantiates a MySQL object, and runs the RPC server for the plugin
-func Run(apiTLSConfig *api.TLSConfig) error {
-	return runCommon(apiTLSConfig)
+var (
+	// ErrBadRequest is returned when arangodb returns http.StatusBadRequest (typically due to some invalid json data)
+	ErrBadRequest = errors.New("BadRequest")
+	// ErrForbidden is returned when arangodb returns http.StatusForbidden
+	ErrForbidden = errors.New("Forbidden")
+	// ErrUnauthorized is returned when arangodb returns http.StatusUnauthorized
+	ErrUnauthorized = errors.New("Unauthorized")
+	// ErrUserExists is returned when arangodb returns http.StatusConflict
+	ErrUserExists = errors.New("User exists")
+	// ErrUnexpected is returned when arangodb returns an unexpected http StatusCode
+	ErrUnexpected = errors.New("Unexpected status code")
+	// ErrNotFound is returned when arangodb returns http.StatusNotFound
+	ErrNotFound = errors.New("NotFound")
+)
+
+// SQLConnectionProducer implements ConnectionProducer and provides a generic producer for most sql databases
+type Arango struct {
+	// syslog server for this plugin log
+	SyslogURL   string
+	Username    string
+	Password    string
+	Host        string
+	Port        string
+	Initialized bool
+	*connutil.SQLConnectionProducer
+	credsutil.CredentialsProducer
+	sync.Mutex
 }
 
-func runCommon(apiTLSConfig *api.TLSConfig) error {
+// UserCredential to be marshalled and sent to arango
+// to create users
+type UserCredential struct {
+	User     string `json:"user"`
+	Password string `json:"passwd"`
+}
+
+// Grant to be marshalled and sent to arango
+// to grant users access to resources. Grant
+// could be 'ro', 'rw' or 'none' (i.e. no access)
+// Per Arango documentation:
+//	rw 		-> Administrate
+//  ro 		-> Access
+//  none 	-> No Access
+type Grant struct {
+	Grant string `json:"grant"`
+}
+
+// ArangoUser represents per-user data in Arnagodb
+type ArangoUser struct {
+	User   string `json:"user"`
+	Active bool   `json:"active"`
+	//Extra  string `json: "extra"`
+}
+
+// ArangoUsers represents collection of ArangoUsers
+type ArangoUsers struct {
+	Error  bool         `json:"error"`
+	Code   int          `json:"code"`
+	Result []ArangoUser `json:"result"`
+}
+
+type Database struct {
+	Name  string `json:"name"`
+	Users []struct {
+		Active   bool   `json:"active"`
+		Username string `json:"username"`
+		Passwd   string `json:"passwd"`
+	} `json:"users"`
+}
+
+//entry
+// Run instantiates a Arango object, and runs the RPC server for the plugin
+func Run(apiTLSConfig *api.TLSConfig) error {
 	var f func() (interface{}, error)
 
 	f = New(MetadataLen, MetadataLen, UsernameLen)
@@ -81,65 +147,68 @@ func new(displayNameLen, roleNameLen, usernameLen int) *Arango {
 	}
 }
 
-// SQLConnectionProducer implements ConnectionProducer and provides a generic producer for most sql databases
-type Arango struct {
-	Url         string
-	Username    string
-	Password    string
-	Host        string
-	Port        string
-	Initialized bool
-	*connutil.SQLConnectionProducer
-	credsutil.CredentialsProducer
-}
-
-type Database struct {
-	Name string `json:"name"`
-	Users []struct{
-		Active bool   `json:"active"`
-		Username string `json:"username"`
-		Passwd string `json:"passwd"`
-	} `json:"users"`
-}
-
+// Database interface function: Type returns the TypeName for the particular database backend implementation
 func (a *Arango) Type() (string, error) {
 	return "arango", nil
 }
 
+// Database interface function: RenewUser is triggered by a renewal call to the API. In many database
+// backends, this triggers a call on the underlying database that extends a VALID UNTIL clause on a user.
 func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, username string, expiration time.Time) error {
-	go aLog("by gary called: RenewUser ")
+	go a.writeLog("called RenewUser. It's not implemented")
 	return nil
 }
 
-func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
-	go aLog("by gary called: RevokeUser ")
-	a.deleteUserInternal(username)
-	return nil
-}
-
+// Database interface function: RotateRootCredentials is triggered by a root credential rotation call to the API.
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
-	go aLog("by gary called: RotateRootCredentials ")
+	go a.writeLog("Arango Vault Plugin: called RotateRootCredentials")
 	return nil, nil
 }
 
+// Database interface function: SetCredentials uses provided information to create or set the credentials
+// for a database user. Unlike CreateUser, this method requires both a
+// username and a password given instead of generating them. This is used for
+// creating and setting the password of static accounts, as well as rolling
+// back passwords in the database in the event an updated database fails to
+// save in Vault's storage.
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
-	go aLog("by gary called: SetCredentials ")
-	return "gary", "test", nil
+	go a.writeLog("Arango Vault Plugin: called SetCredentials ")
+	return "", "", nil
 }
 
+// Database interface function: Init is called on `$ vault write database/config/:db-name`, or when you
+// do a creds call after Vault's been restarted. The config provided won't
+// hold all the keys and values provided in the API call, some will be
+// stripped by the database engine before the config is provided. The config
+// returned will be stored, which will persist it across shutdowns.
 func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyConnection bool) (map[string]interface{}, error) {
+	a.Lock()
+	defer a.Unlock()
 
-	go aLog("by gary called: Init ")
-
-	urlValue, ok := conf["connection_url"]
+	urlValue, ok := conf["syslog_url"]
+	if !ok {
+		// default to local syslog for development
+		a.SyslogURL = "localhost:2514"
+	} else {
+		a.SyslogURL = fmt.Sprint(urlValue)
+	}
 	userValue, ok := conf["username"]
+	if !ok {
+		return nil, fmt.Errorf("")
+	}
 	passValue, ok := conf["password"]
+	if !ok {
+		return nil, fmt.Errorf("")
+	}
 	hostValue, ok := conf["host"]
+	if !ok {
+		return nil, fmt.Errorf("")
+	}
 	portValue, ok := conf["port"]
 	if !ok {
 		return nil, fmt.Errorf("")
 	}
-	a.Url = fmt.Sprint(urlValue)
+
 	a.Username = fmt.Sprint(userValue)
 	a.Password = fmt.Sprint(passValue)
 	a.Host = fmt.Sprint(hostValue)
@@ -148,32 +217,25 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 	// Set initialized to true at this point since all fields are set,
 	// and the connection can be established at a later time.
 	a.Initialized = true
-
 	if verifyConnection {
-		usernames, err := a.verify()
-
+		err := a.verify()
 		if err != nil {
-			fmt.Println("Error in getAllUsers: ", err.Error())
+			return conf, err
 		}
-		fmt.Println("Users in arangodb: ", usernames)
 	}
 
+	go a.writeLog("Arango Vault Plugin: Init finished")
 	return conf, nil
 }
 
+// Database interface function: CreateUser is called on `$ vault read database/creds/:role-name` and it's
+// also the first time anything is touched from `$ vault write database/roles/:role-name`.
+// Currently it supports two cases:
+// 1. db name is provided, create this db and assign the credential to newly created db.
+// 2. db name is NOT provided, create the credential only with no permission to any database.
 func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements, usernameConfig dbplugin.UsernameConfig, expiration time.Time) (username string, password string, err error) {
+	go a.writeLog("called CreateUser")
 
-	go aLog("by gary called: CreateUser ")
-
-	statements = dbutil.StatementCompatibilityHelper(statements)
-
-	if len(statements.Creation) == 0 {
-		return "", "", dbutil.ErrEmptyCreationStatement
-	}
-
-	databaseName := statements.Creation[0]
-
-	go aLog("passed in database name: " + databaseName)
 	username, err = a.GenerateUsername(usernameConfig)
 	if err != nil {
 		return "", "", err
@@ -184,107 +246,104 @@ func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements,
 		return "", "", err
 	}
 
-	a.creatDatabase(username, password, databaseName)
-	//deleteUser(username)
+	statements = dbutil.StatementCompatibilityHelper(statements)
+	if len(statements.Creation) == 0 {
+		go a.writeLog("CreateUser: no database name passed in, only creating user: " + username)
+		err = a.createNewUser(username, password)
+		if err != nil {
+			return username, password, err
+		}
+		return username, password, nil
+	}
 
+	// hardcode the first statement is database name, e.g.: cokeDB
+	databaseName := statements.Creation[0]
+	go a.writeLog("passed in database name: " + databaseName)
+
+	err = a.creatDatabaseAndSetupCredential(username, password, databaseName)
+	if err != nil {
+		return username, password, err
+	}
 	return username, password, nil
 }
 
-func (a *Arango) verify() ([]string, error) {
-	usernames := make([]string, 1)
+// Database interface function: RevokeUser is triggered either automatically by a lease expiration, or by
+// a revocation call to the API.
+func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
+	go a.writeLog("Arango Vault Plugin: called RevokeUser")
 
-	// Formulate req with required headers
-	// GET /_api/user/
-	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathUserMgmt)
+	statements = dbutil.StatementCompatibilityHelper(statements)
+	if len(statements.Creation) != 0 {
+		go a.writeLog("RevokeUser: no database name passed in, only deleting user: " + username)
+
+		// hardcode the first statement is database name, e.g.: cokeDB
+		databaseName := statements.Creation[0]
+		go a.writeLog("passed in database name: " + databaseName)
+
+		err := a.deleteDatabase(databaseName)
+		if err != nil {
+			return err
+		}
+	}
+
+	err := a.deleteUser(username)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Verify connection by called restricted API
+func (a *Arango) verify() error {
+	// check whether or not the connection is valid by getting Arango server time
+	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemTime)
 	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
-		return nil, err
-	}
-	req.SetBasicAuth(a.Username, a.Password)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return nil, err
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
 	}
 
 	// Process response
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		var users ArangoUsers
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println("Error in ReadAll: ", err.Error())
-			return nil, err
-		}
-		err = json.Unmarshal(body, &users)
-		if err != nil {
-			fmt.Println("Error in Marshall: ", err.Error())
-			return nil, err
-		}
-		for _, user := range users.Result {
-			usernames = append(usernames, user.User)
-		}
-	} else {
-		return nil, processErr(resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return processErr(resp.StatusCode)
 	}
-	return usernames, nil
+	return nil
 }
 
-func (a *Arango) creatDatabase(username, password, dbname string) error {
-
-	// Marshal grant
+// Create new database, account. And assign the new credential to the database.
+func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname string) error {
 	database := &Database{
 		Name: dbname,
 		Users: []struct {
-			Active bool   `json:"active"`
+			Active   bool   `json:"active"`
 			Username string `json:"username"`
-			Passwd string `json:"passwd"`
-		}{
-			{Active: true, Username: username, Passwd: password},
-		},
+			Passwd   string `json:"passwd"`
+		}{{Active: true, Username: username, Passwd: password}},
 	}
-	fmt.Println(database)
-
 	databaseJson, err := json.Marshal(database)
 	if err != nil {
-		fmt.Println("Error in Marshal: ", err.Error())
+		go a.writeLog("Error in Marshal: " + err.Error())
 		return err
 	}
 
 	// Formulate req with required headers
 	// POST http://localhost:8529/_db/_system/_api/database
 	//
-	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemDb)
+	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemDB)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(databaseJson))
 	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
+		go a.writeLog("Error in NewRequest: " + err.Error())
 		return err
 	}
-	req.SetBasicAuth(a.Username, a.Password)
-	req.Header.Add("Accept", "application/json")
 
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
 	}
 
 	// Process response
-	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusCreated {
-		fmt.Printf("database %s has been created for user %s\n", dbname, username)
-		go aLog("database " + dbname + " has been created for user " + username)
+		go a.writeLog("database " + dbname + " has been created for user " + username)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
@@ -301,7 +360,7 @@ func (a *Arango) createNewUser(username string, password string) error {
 	}
 	userjson, err := json.Marshal(userCred)
 	if err != nil {
-		fmt.Println("Error in Marshal: ", err.Error())
+		go a.writeLog("Error in Marshal: " + err.Error())
 		return err
 	}
 
@@ -310,26 +369,17 @@ func (a *Arango) createNewUser(username string, password string) error {
 	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathUserMgmt)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(userjson))
 	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
+		go a.writeLog("Error in NewRequest: " + err.Error())
 		return err
 	}
-	req.SetBasicAuth(a.Username, a.Password)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
 	}
 
 	// Process response
-	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusCreated {
-		fmt.Printf("User %s created successfully\n", username)
+		go a.writeLog("Successfully created user: " + username)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
@@ -337,15 +387,71 @@ func (a *Arango) createNewUser(username string, password string) error {
 }
 
 // deleteUser deletes 'username' from arangodb
-func (a *Arango) deleteUserInternal(username string) error {
+func (a *Arango) deleteUser(username string) error {
 	// Formulate req with required headers
 	// DELETE /_api/user/{user}
 	url := fmt.Sprintf("http://%s:%s/%s/%s", a.Host, a.Port, pathUserMgmt, username)
-	fmt.Println(url)
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
+		go a.writeLog("Error in NewRequest: " + err.Error())
 		return err
+	}
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
+	}
+
+	// Process response
+	if resp.StatusCode == http.StatusAccepted {
+		go a.writeLog("Successfully deleted user: " + username)
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+// Create new database, account. And assign the new credential to the database.
+func (a *Arango) deleteDatabase(dbname string) error {
+	// Formulate req with required headers
+	// POST http://localhost:8529/_db/_system/_api/database
+	url := fmt.Sprintf("http://%s:%s/%s/%s", a.Host, a.Port, pathSystemDB, dbname)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		go a.writeLog("Error in NewRequest: " + err.Error())
+		return err
+	}
+
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
+	}
+
+	// Process response
+	if resp.StatusCode == http.StatusOK {
+		go a.writeLog("database " + dbname + " has been deleted")
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+func (a *Arango) writeLog(msg string) {
+	sysLog, err := syslog.Dial("tcp", a.SyslogURL,
+		syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
+	if err != nil {
+		log.Println("local Arango Vault Plugin: " + msg)
+		return
+	}
+	fmt.Fprintf(sysLog, "Arango Vault Plugin: "+msg)
+}
+
+func (a *Arango) executeRequest(err error, req *http.Request) (*http.Response, error) {
+	if !a.Initialized {
+		return nil, errors.New("arango Plugin is not initialized")
+	}
+	if err != nil {
+		go a.writeLog("Error in NewRequest: " + err.Error())
+		return nil, err
 	}
 	req.SetBasicAuth(a.Username, a.Password)
 	req.Header.Add("Accept", "application/json")
@@ -355,93 +461,12 @@ func (a *Arango) deleteUserInternal(username string) error {
 		Timeout: 10 * time.Second,
 	}
 	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
-	}
-
-	// Process response
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusAccepted {
-		fmt.Printf("User %s deleted successfully\n", username)
-		return nil
-	} else {
-		return processErr(resp.StatusCode)
-	}
-}
-
-
-func aLog(msg string) {
-	sysLog, err := syslog.Dial("tcp", "localhost:2514",
-		syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
 	if err != nil {
-		//log.Fatal(err)
-		//log.Println("cannot connect to rsyslog")
-		log.Println("local log" + msg)
-		return
+		go a.writeLog("Error in req.Do: " + err.Error())
+		return nil, err
 	}
-	fmt.Fprintf(sysLog, msg)
-}
-
-
-
-// change end
-
-const (
-	host         string = "192.168.1.24"
-	port         int    = 8529
-	pathUserMgmt string = "_api/user"
-	// user 'root' is the default arango user with 'rw' access to '_system' db
-	adminUserName string = "root"
-	adminPassword string = "root"
-	pathSystemDb string = "_db/_system/_api/database"
-)
-
-var (
-	// ErrBadRequest is returned when arangodb returns http.StatusBadRequest (typically due to some invalid json data)
-	ErrBadRequest = errors.New("BadRequest")
-	// ErrForbidden is returned when arangodb returns http.StatusForbidden
-	ErrForbidden = errors.New("Forbidden")
-	// ErrUnauthorized is returned when arangodb returns http.StatusUnauthorized
-	ErrUnauthorized = errors.New("Unauthorized")
-	// ErrUserExists is returned when arangodb returns http.StatusConflict
-	ErrUserExists = errors.New("User exists")
-	// ErrUnexpected is returned when arangodb returns an unexpected http StatusCode
-	ErrUnexpected = errors.New("Unexpected status code")
-	// ErrNotFound is returned when arangodb returns http.StatusNotFound
-	ErrNotFound = errors.New("NotFound")
-)
-
-// UserCredential to be marshalled and sent to arango
-// to create users
-type UserCredential struct {
-	User     string `json:"user"`
-	Password string `json:"passwd"`
-}
-
-// Grant to be marshalled and sent to arango
-// to grant users access to resources. Grant
-// could be 'ro', 'rw' or 'none' (i.e. no access)
-// Per Arango documentation:
-//	rw 		-> Administrate
-//  ro 		-> Access
-//  none 	-> No Access
-type Grant struct {
-	Grant string `json:"grant"`
-}
-
-// ArangoUser represents per-user data in Arnagodb
-type ArangoUser struct {
-	User   string `json:"user"`
-	Active bool   `json:"active"`
-	//Extra  string `json: "extra"`
-}
-
-// ArangoUsers represents collection of ArangoUsers
-type ArangoUsers struct {
-	Error  bool         `json:"error"`
-	Code   int          `json:"code"`
-	Result []ArangoUser `json:"result"`
+	return resp, nil
 }
 
 func processErr(code int) error {
@@ -464,208 +489,4 @@ func processErr(code int) error {
 	default:
 		return ErrUnexpected
 	}
-}
-
-// grantAccess grants 'user' either 'rw', 'ro' or 'none'
-// access to 'dbname'
-func grantAccess(username, dbname, grantStr string) error {
-	// Marshal grant
-	grant := &Grant{
-		Grant: grantStr,
-	}
-	grantjson, err := json.Marshal(grant)
-	if err != nil {
-		fmt.Println("Error in Marshal: ", err.Error())
-		return err
-	}
-
-	// Formulate req with required headers
-	// PUT /_api/user/{user}/database/{dbname}
-	url := fmt.Sprintf("http://%s:%d/%s/%s/database/%s", host, port, pathUserMgmt, username, dbname)
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(grantjson))
-	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
-		return err
-	}
-	req.SetBasicAuth(adminUserName, adminPassword)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
-	}
-
-	// Process response
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		fmt.Printf("User %s granted %s access to %s\n", username, grantStr, dbname)
-		return nil
-	} else {
-		return processErr(resp.StatusCode)
-	}
-}
-
-// createUser creates 'username' with password 'password'
-// in arangodb. Creating a user
-func createUser(username string, password string) error {
-	// Marshal username & password
-	userCred := &UserCredential{
-		User:     username,
-		Password: password,
-	}
-	userjson, err := json.Marshal(userCred)
-	if err != nil {
-		fmt.Println("Error in Marshal: ", err.Error())
-		return err
-	}
-
-	// Formulate req with required headers
-	// POST /_api/user
-	url := fmt.Sprintf("http://%s:%d/%s", host, port, pathUserMgmt)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(userjson))
-	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
-		return err
-	}
-	req.SetBasicAuth(adminUserName, adminPassword)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
-	}
-
-	// Process response
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusCreated {
-		fmt.Printf("User %s created successfully\n", username)
-		return nil
-	} else {
-		return processErr(resp.StatusCode)
-	}
-}
-
-// deleteUser deletes 'username' from arangodb
-func deleteUser(username string) error {
-	// Formulate req with required headers
-	// DELETE /_api/user/{user}
-	url := fmt.Sprintf("http://%s:%d/%s/%s", host, port, pathUserMgmt, username)
-	fmt.Println(url)
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
-		return err
-	}
-	req.SetBasicAuth(adminUserName, adminPassword)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return err
-	}
-
-	// Process response
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusAccepted {
-		fmt.Printf("User %s deleted successfully\n", username)
-		return nil
-	} else {
-		return processErr(resp.StatusCode)
-	}
-}
-
-func getAllUsers() ([]string, error) {
-	usernames := make([]string, 1)
-
-	// Formulate req with required headers
-	// GET /_api/user/
-	url := fmt.Sprintf("http://%s:%d/%s", host, port, pathUserMgmt)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		fmt.Println("Error in NewRequest: ", err.Error())
-		return nil, err
-	}
-	req.SetBasicAuth(adminUserName, adminPassword)
-	req.Header.Add("Accept", "application/json")
-
-	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := arangoClient.Do(req)
-	if err != nil {
-		fmt.Println("Error in req.Do: ", err.Error())
-		return nil, err
-	}
-
-	// Process response
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		var users ArangoUsers
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println("Error in ReadAll: ", err.Error())
-			return nil, err
-		}
-		err = json.Unmarshal(body, &users)
-		if err != nil {
-			fmt.Println("Error in Marshall: ", err.Error())
-			return nil, err
-		}
-		for _, user := range users.Result {
-			usernames = append(usernames, user.User)
-		}
-	} else {
-		return nil, processErr(resp.StatusCode)
-	}
-	return usernames, nil
-}
-
-func main() {
-	// Create a new user
-	err := createUser("test2", "test2password")
-	if err != nil {
-		fmt.Println("Error in createUser: ", err.Error())
-	}
-
-	// Grant user, 'test' 'rw' access to 'testdb'
-	err = grantAccess("test2", "testdb", "rw")
-	if err != nil {
-		fmt.Println("Error in grantAccess: ", err.Error())
-	}
-
-	// List all provisioned arangodb users
-	usernames, err := getAllUsers()
-	if err != nil {
-		fmt.Println("Error in getAllUsers: ", err.Error())
-	}
-	fmt.Println("Users in arangodb: ", usernames)
-
-	// Delete a new user
-	err = deleteUser("test2")
-	if err != nil {
-		fmt.Println("Error in deleteUser: ", err.Error())
-	}
-
-	// List all provisioned arangodb users
-	usernames, err = getAllUsers()
-	if err != nil {
-		fmt.Println("Error in getAllUsers: ", err.Error())
-	}
-	fmt.Println("Users in arangodb: ", usernames)
 }
