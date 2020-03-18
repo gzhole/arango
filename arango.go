@@ -23,7 +23,7 @@ import (
 
 const (
 	MetadataLen  int    = 10
-	UsernameLen  int    = 16
+	UsernameLen  int    = 32
 	pathUserMgmt string = "_api/user"
 	pathSystemDB string = "_db/_system/_api/database"
 	// connection availability check
