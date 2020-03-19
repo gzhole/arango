@@ -247,7 +247,7 @@ func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements,
 	statements = dbutil.StatementCompatibilityHelper(statements)
 	if len(statements.Creation) == 0 {
 		go a.writeLog("CreateUser: no database name passed in, only creating user: " + username)
-		err = a.createNewUser(username, password)
+		err = a.createUser(username, password)
 		if err != nil {
 			return username, password, err
 		}
@@ -272,12 +272,9 @@ func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements,
 
 	statements = dbutil.StatementCompatibilityHelper(statements)
 	if len(statements.Creation) != 0 {
-		go a.writeLog("RevokeUser: no database name passed in, only deleting user: " + username)
-
 		// hardcode the first statement is database name, e.g.: cokeDB
 		databaseName := statements.Creation[0]
-		go a.writeLog("passed in database name: " + databaseName)
-
+		go a.writeLog("RevokeUser: database name passed in, delete both database and user")
 		err := a.deleteDatabase(databaseName)
 		if err != nil {
 			return err
@@ -341,7 +338,7 @@ func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname stri
 
 	// Process response
 	if resp.StatusCode == http.StatusCreated {
-		go a.writeLog("database " + dbname + " has been created for user " + username)
+		go a.writeLog("database " + dbname + " has been created for new user " + username)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
@@ -350,7 +347,7 @@ func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname stri
 
 // createUser creates 'username' with password 'password'
 // in arangodb. Creating a user
-func (a *Arango) createNewUser(username string, password string) error {
+func (a *Arango) createUser(username string, password string) error {
 	// Marshal username & password
 	userCred := &UserCredential{
 		User:     username,
@@ -377,7 +374,7 @@ func (a *Arango) createNewUser(username string, password string) error {
 
 	// Process response
 	if resp.StatusCode == http.StatusCreated {
-		go a.writeLog("Successfully created user: " + username)
+		go a.writeLog("created user: " + username)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
@@ -401,7 +398,7 @@ func (a *Arango) deleteUser(username string) error {
 
 	// Process response
 	if resp.StatusCode == http.StatusAccepted {
-		go a.writeLog("Successfully deleted user: " + username)
+		go a.writeLog("deleted user: " + username)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
@@ -426,7 +423,7 @@ func (a *Arango) deleteDatabase(dbname string) error {
 
 	// Process response
 	if resp.StatusCode == http.StatusOK {
-		go a.writeLog("database " + dbname + " has been deleted")
+		go a.writeLog("deleted database: " + dbname)
 		return nil
 	} else {
 		return processErr(resp.StatusCode)
