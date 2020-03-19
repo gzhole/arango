@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	MetadataLen  int    = 10
-	UsernameLen  int    = 32
+	arango              = "arango"
+	metadataLen  int    = 10
+	usernameLen  int    = 32
 	pathUserMgmt string = "_api/user"
 	pathSystemDB string = "_db/_system/_api/database"
 	// connection availability check
@@ -104,17 +105,14 @@ type Database struct {
 }
 
 //entry
-// Run instantiates a Arango object, and runs the RPC server for the plugin
+// Run instantiates an Arango object, and runs the RPC server for the plugin
 func Run(apiTLSConfig *api.TLSConfig) error {
 	var f func() (interface{}, error)
-
-	f = New(MetadataLen, MetadataLen, UsernameLen)
-
+	f = New(metadataLen, metadataLen, usernameLen)
 	dbType, err := f()
 	if err != nil {
 		return err
 	}
-
 	dbplugin.Serve(dbType.(dbplugin.Database), api.VaultPluginTLSProvider(apiTLSConfig))
 
 	return nil
@@ -133,7 +131,7 @@ func New(displayNameLen, roleNameLen, usernameLen int) func() (interface{}, erro
 
 func new(displayNameLen, roleNameLen, usernameLen int) *Arango {
 	connProducer := &connutil.SQLConnectionProducer{}
-	connProducer.Type = "mysql"
+	connProducer.Type = arango
 
 	credsProducer := &credsutil.SQLCredentialsProducer{
 		DisplayNameLen: displayNameLen,
@@ -150,7 +148,7 @@ func new(displayNameLen, roleNameLen, usernameLen int) *Arango {
 
 // Database interface function: Type returns the TypeName for the particular database backend implementation
 func (a *Arango) Type() (string, error) {
-	return "arango", nil
+	return arango, nil
 }
 
 // Database interface function: RenewUser is triggered by a renewal call to the API. In many database
@@ -438,7 +436,7 @@ func (a *Arango) writeLog(msg string) {
 			log.Println("local Arango Vault Plugin: " + msg)
 			return
 		}
-		fmt.Fprintf(sysLog, time.Now().Format("2006-01-02T15:04:05")+ " "+ msg)
+		fmt.Fprintf(sysLog, time.Now().Format("2006-01-02T15:04:05")+" "+msg)
 	} else {
 		log.Println("local Arango Vault Plugin: " + msg)
 	}
@@ -460,11 +458,11 @@ func (a *Arango) executeRequest(err error, req *http.Request) (*http.Response, e
 		Timeout: 10 * time.Second,
 	}
 	resp, err := arangoClient.Do(req)
-	defer resp.Body.Close()
 	if err != nil {
 		go a.writeLog("Error in req.Do: " + err.Error())
 		return nil, err
 	}
+	defer resp.Body.Close()
 	return resp, nil
 }
 
