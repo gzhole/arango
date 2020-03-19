@@ -17,6 +17,7 @@ import (
 	"log"
 	"log/syslog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -161,7 +162,7 @@ func (a *Arango) RenewUser(ctx context.Context, statements dbplugin.Statements, 
 
 // Database interface function: RotateRootCredentials is triggered by a root credential rotation call to the API.
 func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string) (config map[string]interface{}, err error) {
-	go a.writeLog("Arango Vault Plugin: called RotateRootCredentials")
+	go a.writeLog("called RotateRootCredentials")
 	return nil, nil
 }
 
@@ -172,7 +173,7 @@ func (a *Arango) RotateRootCredentials(ctx context.Context, statements []string)
 // back passwords in the database in the event an updated database fails to
 // save in Vault's storage.
 func (a *Arango) SetCredentials(ctx context.Context, statements dbplugin.Statements, staticConfig dbplugin.StaticUserConfig) (username string, password string, err error) {
-	go a.writeLog("Arango Vault Plugin: called SetCredentials ")
+	go a.writeLog("called SetCredentials ")
 	return "", "", nil
 }
 
@@ -186,11 +187,8 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 	defer a.Unlock()
 
 	urlValue, ok := conf["syslog_url"]
-	if !ok {
-		// default to local syslog for development
-		a.SyslogURL = "localhost:2514"
-	} else {
-		a.SyslogURL = fmt.Sprint(urlValue)
+	if ok {
+		a.SyslogURL = strings.TrimSpace(fmt.Sprint(urlValue))
 	}
 	userValue, ok := conf["username"]
 	if !ok {
@@ -209,10 +207,10 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 		return nil, fmt.Errorf("")
 	}
 
-	a.Username = fmt.Sprint(userValue)
-	a.Password = fmt.Sprint(passValue)
-	a.Host = fmt.Sprint(hostValue)
-	a.Port = fmt.Sprint(portValue)
+	a.Username = strings.TrimSpace(fmt.Sprint(userValue))
+	a.Password = strings.TrimSpace(fmt.Sprint(passValue))
+	a.Host = strings.TrimSpace(fmt.Sprint(hostValue))
+	a.Port = strings.TrimSpace(fmt.Sprint(portValue))
 
 	// Set initialized to true at this point since all fields are set,
 	// and the connection can be established at a later time.
@@ -224,7 +222,7 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 		}
 	}
 
-	go a.writeLog("Arango Vault Plugin: Init finished")
+	go a.writeLog("Init finished")
 	return conf, nil
 }
 
@@ -270,7 +268,7 @@ func (a *Arango) CreateUser(ctx context.Context, statements dbplugin.Statements,
 // Database interface function: RevokeUser is triggered either automatically by a lease expiration, or by
 // a revocation call to the API.
 func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements, username string) error {
-	go a.writeLog("Arango Vault Plugin: called RevokeUser")
+	go a.writeLog("called RevokeUser")
 
 	statements = dbutil.StatementCompatibilityHelper(statements)
 	if len(statements.Creation) != 0 {
@@ -310,7 +308,7 @@ func (a *Arango) verify() error {
 	return nil
 }
 
-// Create new database, account. And assign the new credential to the database.
+// Create new database, credential. And assign the new credential to the database.
 func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname string) error {
 	database := &Database{
 		Name: dbname,
@@ -436,13 +434,17 @@ func (a *Arango) deleteDatabase(dbname string) error {
 }
 
 func (a *Arango) writeLog(msg string) {
-	sysLog, err := syslog.Dial("tcp", a.SyslogURL,
-		syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
-	if err != nil {
+	if a.SyslogURL != "" {
+		sysLog, err := syslog.Dial("tcp", a.SyslogURL,
+			syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
+		if err != nil {
+			log.Println("local Arango Vault Plugin: " + msg)
+			return
+		}
+		fmt.Fprintf(sysLog, time.Now().Format("2006-01-02T15:04:05")+ " "+ msg)
+	} else {
 		log.Println("local Arango Vault Plugin: " + msg)
-		return
 	}
-	fmt.Fprintf(sysLog, "Arango Vault Plugin: "+msg)
 }
 
 func (a *Arango) executeRequest(err error, req *http.Request) (*http.Response, error) {
