@@ -6,6 +6,7 @@ package arango
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ const (
 	pathSystemDB string = "_db/_system/_api/database"
 	// connection availability check
 	pathSystemTime string = "_db/_system/_admin/time"
+	https                 = "https"
 )
 
 var _ dbplugin.Database = (*Arango)(nil)
@@ -52,12 +54,13 @@ var (
 // SQLConnectionProducer implements ConnectionProducer and provides a generic producer for most sql databases
 type Arango struct {
 	// syslog server for this plugin log
-	SyslogURL   string
-	Username    string
-	Password    string
-	Host        string
-	Port        string
-	Initialized bool
+	SyslogURL    string
+	Username     string
+	Password     string
+	Host         string
+	Port         string
+	Initialized  bool
+	httpProtocol string
 	*connutil.SQLConnectionProducer
 	credsutil.CredentialsProducer
 	sync.Mutex
@@ -188,6 +191,15 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 	if ok {
 		a.SyslogURL = strings.TrimSpace(fmt.Sprint(urlValue))
 	}
+	httpProtocolValue, ok := conf["http_protocol"]
+	if ok {
+		if strings.ToLower(strings.TrimSpace(fmt.Sprint(httpProtocolValue))) == "http" {
+			a.httpProtocol = "http"
+		}
+	} else {
+		// default is secure connection
+		a.httpProtocol = https
+	}
 	userValue, ok := conf["username"]
 	if !ok {
 		return nil, fmt.Errorf("")
@@ -220,7 +232,7 @@ func (a *Arango) Init(ctx context.Context, conf map[string]interface{}, verifyCo
 		}
 	}
 
-	go a.writeLog("Init finished")
+	go a.writeLog("Init finished wiht http connection to: " + a.httpProtocol)
 	return conf, nil
 }
 
@@ -269,9 +281,9 @@ func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements,
 	go a.writeLog("called RevokeUser")
 
 	statements = dbutil.StatementCompatibilityHelper(statements)
-	if len(statements.Creation) != 0 {
+	if len(statements.Revocation) != 0 {
 		// hardcode the first statement is database name, e.g.: cokeDB
-		databaseName := statements.Creation[0]
+		databaseName := statements.Revocation[0]
 		go a.writeLog("RevokeUser: database name passed in, delete both database and user")
 		err := a.deleteDatabase(databaseName)
 		if err != nil {
@@ -289,7 +301,7 @@ func (a *Arango) RevokeUser(ctx context.Context, statements dbplugin.Statements,
 // Verify connection by called restricted API
 func (a *Arango) verify() error {
 	// check whether or not the connection is valid by getting Arango server time
-	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemTime)
+	url := fmt.Sprintf("%s://%s:%s/%s", a.httpProtocol, a.Host, a.Port, pathSystemTime)
 	req, err := http.NewRequest("GET", url, nil)
 	resp, err2 := a.executeRequest(err, req)
 	if err2 != nil {
@@ -322,13 +334,8 @@ func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname stri
 	// Formulate req with required headers
 	// POST http://localhost:8529/_db/_system/_api/database
 	//
-	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathSystemDB)
+	url := fmt.Sprintf("%s://%s:%s/%s", a.httpProtocol, a.Host, a.Port, pathSystemDB)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(databaseJson))
-	if err != nil {
-		go a.writeLog("Error in NewRequest: " + err.Error())
-		return err
-	}
-
 	resp, err2 := a.executeRequest(err, req)
 	if err2 != nil {
 		return err2
@@ -338,6 +345,17 @@ func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname stri
 	if resp.StatusCode == http.StatusCreated {
 		go a.writeLog("database " + dbname + " has been created for new user " + username)
 		return nil
+	} else if resp.StatusCode == http.StatusConflict {
+		// database existed, will create user and grant rw access permission
+		err = a.createUser(username, password)
+		if err != nil {
+			return err
+		}
+		err = a.grantAccess(dbname, username, "rw")
+		if err != nil {
+			return err
+		}
+		return nil
 	} else {
 		return processErr(resp.StatusCode)
 	}
@@ -345,7 +363,7 @@ func (a *Arango) creatDatabaseAndSetupCredential(username, password, dbname stri
 
 // createUser creates 'username' with password 'password'
 // in arangodb. Creating a user
-func (a *Arango) createUser(username string, password string) error {
+func (a *Arango) createUser(username, password string) error {
 	// Marshal username & password
 	userCred := &UserCredential{
 		User:     username,
@@ -359,12 +377,8 @@ func (a *Arango) createUser(username string, password string) error {
 
 	// Formulate req with required headers
 	// POST /_api/user
-	url := fmt.Sprintf("http://%s:%s/%s", a.Host, a.Port, pathUserMgmt)
+	url := fmt.Sprintf("%s://%s:%s/%s", a.httpProtocol, a.Host, a.Port, pathUserMgmt)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(userjson))
-	if err != nil {
-		go a.writeLog("Error in NewRequest: " + err.Error())
-		return err
-	}
 	resp, err2 := a.executeRequest(err, req)
 	if err2 != nil {
 		return err2
@@ -383,12 +397,8 @@ func (a *Arango) createUser(username string, password string) error {
 func (a *Arango) deleteUser(username string) error {
 	// Formulate req with required headers
 	// DELETE /_api/user/{user}
-	url := fmt.Sprintf("http://%s:%s/%s/%s", a.Host, a.Port, pathUserMgmt, username)
+	url := fmt.Sprintf("%s://%s:%s/%s/%s", a.httpProtocol, a.Host, a.Port, pathUserMgmt, username)
 	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		go a.writeLog("Error in NewRequest: " + err.Error())
-		return err
-	}
 	resp, err2 := a.executeRequest(err, req)
 	if err2 != nil {
 		return err2
@@ -407,13 +417,8 @@ func (a *Arango) deleteUser(username string) error {
 func (a *Arango) deleteDatabase(dbname string) error {
 	// Formulate req with required headers
 	// POST http://localhost:8529/_db/_system/_api/database
-	url := fmt.Sprintf("http://%s:%s/%s/%s", a.Host, a.Port, pathSystemDB, dbname)
+	url := fmt.Sprintf("%s://%s:%s/%s/%s", a.httpProtocol, a.Host, a.Port, pathSystemDB, dbname)
 	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		go a.writeLog("Error in NewRequest: " + err.Error())
-		return err
-	}
-
 	resp, err2 := a.executeRequest(err, req)
 	if err2 != nil {
 		return err2
@@ -423,6 +428,42 @@ func (a *Arango) deleteDatabase(dbname string) error {
 	if resp.StatusCode == http.StatusOK {
 		go a.writeLog("deleted database: " + dbname)
 		return nil
+	} else if resp.StatusCode == http.StatusNotFound {
+		go a.writeLog("database: " + dbname + " is not found, skip deleting.")
+		return nil
+	} else {
+		return processErr(resp.StatusCode)
+	}
+}
+
+// grantAccess grants 'user' either 'rw', 'ro' or 'none'
+// access to 'dbname'
+func (a *Arango) grantAccess(dbname, username, grantStr string) error {
+	// Marshal grant
+	grant := &Grant{
+		Grant: grantStr,
+	}
+	grantjson, err := json.Marshal(grant)
+	if err != nil {
+		fmt.Println("Error in Marshal: ", err.Error())
+		return err
+	}
+
+	// Formulate req with required headers
+	// PUT /_api/user/{user}/database/{dbname}
+	url := fmt.Sprintf("%s://%s:%s/%s/%s/database/%s", a.httpProtocol, a.Host, a.Port, pathUserMgmt, username, dbname)
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(grantjson))
+
+	resp, err2 := a.executeRequest(err, req)
+	if err2 != nil {
+		return err2
+	}
+
+	// Process response
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		go a.writeLog(fmt.Sprintf("User %s granted %s access to %s\n", username, grantStr, dbname))
+		return nil
 	} else {
 		return processErr(resp.StatusCode)
 	}
@@ -431,7 +472,7 @@ func (a *Arango) deleteDatabase(dbname string) error {
 func (a *Arango) writeLog(msg string) {
 	if a.SyslogURL != "" {
 		sysLog, err := syslog.Dial("tcp", a.SyslogURL,
-			syslog.LOG_WARNING|syslog.LOG_DAEMON, "vault")
+			syslog.LOG_WARNING|syslog.LOG_DAEMON, "Vault-Arango-Plugin")
 		if err != nil {
 			log.Println("local Arango Vault Plugin: " + msg)
 			return
@@ -454,9 +495,22 @@ func (a *Arango) executeRequest(err error, req *http.Request) (*http.Response, e
 	req.Header.Add("Accept", "application/json")
 
 	// Send req
-	arangoClient := &http.Client{
-		Timeout: 10 * time.Second,
+	var arangoClient *http.Client
+	if a.httpProtocol == https {
+		arangoClient = &http.Client{Timeout: 10 * time.Second}
+		{
+			arangoClient = &http.Client{
+				Timeout: 10 * time.Second,
+				// TODO remove "InsecureSkipVerify: true"
+				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			}
+		}
+	} else {
+		arangoClient = &http.Client{
+			Timeout: 10 * time.Second,
+		}
 	}
+
 	resp, err := arangoClient.Do(req)
 	if err != nil {
 		go a.writeLog("Error in req.Do: " + err.Error())
